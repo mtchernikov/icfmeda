@@ -1,16 +1,18 @@
 # streamlit_app.py
-# Streamlit Cloud app to build an IC FMEDA from a draw.io block diagram + user rules + LLM reasoning
-# Author: ChatGPT
-# Notes:
-# - Add a requirements.txt with: streamlit, pandas, openpyxl, xlsxwriter, pyyaml, openai
-# - Set your OpenAI API key in Streamlit Secrets: OPENAI_API_KEY
-# - If no API key is set, the app still works in "deterministic baseline" mode (no LLM).
+# Streamlit Cloud app to build an IC FMEDA from a draw.io block diagram + user rules + optional LLM reasoning
+# One-file script. Requirements (requirements.txt):
+#   streamlit
+#   pandas
+#   openpyxl
+#   xlsxwriter
+#   pyyaml
+#   openai
+# In Streamlit Cloud, set Secrets -> OPENAI_API_KEY
 
 import base64
 import io
 import json
 import re
-import sys
 import zlib
 import html
 import xml.etree.ElementTree as ET
@@ -39,29 +41,26 @@ st.set_page_config(page_title="IC FMEDA Builder (draw.io + rules + LLM)", layout
 # ----------------------------- Utilities -----------------------------
 
 def decode_drawio_diagram(diagram_elem: ET.Element) -> Optional[ET.Element]:
-    """Return an mxGraphModel element given a <diagram> element.
-    Handles plain XML or compressed/encoded content.
+    """Return the mxGraphModel element for a <diagram>.
+    Supports plain embedded XML and compressed base64 deflate payloads.
     """
-    # Case 1: diagram contains an mxGraphModel child directly
+    # Case 1: embedded mxGraphModel
     mx_models = diagram_elem.findall(".//mxGraphModel")
     if mx_models:
         return mx_models[0]
 
-    # Case 2: diagram.text contains compressed XML (base64 deflate)
     text = (diagram_elem.text or "").strip()
     if not text:
         return None
     try:
         raw = base64.b64decode(text)
-        # draw.io uses "raw deflate" (no zlib header) often; try both
         try:
-            xml_bytes = zlib.decompress(raw, -zlib.MAX_WBITS)
+            xml_bytes = zlib.decompress(raw, -zlib.MAX_WBITS)  # raw deflate
         except zlib.error:
-            xml_bytes = zlib.decompress(raw)
+            xml_bytes = zlib.decompress(raw)  # zlib header
         inner = ET.fromstring(xml_bytes)
         if inner.tag == "mxGraphModel":
             return inner
-        # Or nested
         found = inner.find(".//mxGraphModel")
         return found
     except Exception:
@@ -69,7 +68,7 @@ def decode_drawio_diagram(diagram_elem: ET.Element) -> Optional[ET.Element]:
 
 
 def parse_drawio(file_bytes: bytes) -> Tuple[List[Dict], List[Dict]]:
-    """Parse a .drawio file and extract nodes (vertices) and edges.
+    """Parse a .drawio (diagrams.net) file and extract nodes (vertices) and edges.
     Returns: (nodes, edges)
     nodes: {id, label, style, x, y, w, h}
     edges: {id, source, target, label}
@@ -77,24 +76,18 @@ def parse_drawio(file_bytes: bytes) -> Tuple[List[Dict], List[Dict]]:
     try:
         root = ET.fromstring(file_bytes)
     except ET.ParseError as e:
-        # Some draw.io files are saved as XML string in a wrapper; try a decode fallback
         raise RuntimeError(f"Failed to parse draw.io XML: {e}")
 
-    # Locate diagrams
     diagrams = root.findall(".//diagram")
-    if not diagrams:
-        # Maybe the root is already mxGraphModel
-        if root.tag == "mxGraphModel":
-            model = root
-        else:
-            raise RuntimeError("No <diagram> found in draw.io file.")
-    else:
-        # Use the first diagram by default
+    if diagrams:
         model = decode_drawio_diagram(diagrams[0])
         if model is None:
             raise RuntimeError("Could not decode the <diagram> content into mxGraphModel.")
+    elif root.tag == "mxGraphModel":
+        model = root
+    else:
+        raise RuntimeError("No <diagram> found in draw.io file.")
 
-    # Now parse cells
     cells = model.findall(".//mxCell")
     nodes: List[Dict] = []
     edges: List[Dict] = []
@@ -127,7 +120,6 @@ def parse_drawio(file_bytes: bytes) -> Tuple[List[Dict], List[Dict]]:
             })
     return nodes, edges
 
-# Simple classifier
 PORT_KEYWORDS = {
     "VIN","BAT","SYS","SW","TS","NTC","ILIM","PROG","I2C","SDA","SCL","PG","STAT","LDO","DCDC","USB","VREF","GND","AGND","PGND","DSS","LPO","EN","CE","CHG","OVP","UVLO","OV","UV","THERM","VBUS","VBAT","PMID"
 }
@@ -195,7 +187,7 @@ class Diagram:
         return out
 
     def adjacency(self) -> Dict[str, List[str]]:
-        adj = {}
+        adj: Dict[str, List[str]] = {}
         for e in self.edges:
             s, t = e.get("source"), e.get("target")
             if s and t:
@@ -206,7 +198,7 @@ class Diagram:
 DEFAULT_RULES_YAML = """
 version: 1
 matchers:
-  # Each matcher assigns a type and default failure modes based on label keywords
+  # Example matcher: Buck/DC-DC
   - name: buck
     when:
       any_label_contains: ["buck", "dcdc"]
@@ -260,7 +252,6 @@ matchers:
         local_effect: SYS→GND; undervoltage
 
 propagation_hints:
-  # Optional patterns to help LLM follow risk paths
   - from_type: buck converter
     to_labels_regex: "SYS|BAT"
     failure_mode_names: ["SW short to VIN", "HS-FET short (on)"]
@@ -290,7 +281,7 @@ goals_text = st.sidebar.text_area(
 
 st.sidebar.markdown("---")
 llm_enabled = st.sidebar.toggle("Use LLM reasoning", value=True)
-model = st.sidebar.selectbox("Model", ["gpt-4o", "gpt-4o-mini", "gpt-5"], index=0)
+model = st.sidebar.selectbox("Model", ["gpt-4o", "gpt-4o-mini", "gpt-5"], index=1)
 max_rows = st.sidebar.slider("Max FMEDA rows from LLM", min_value=50, max_value=1000, value=300, step=50)
 
 st.sidebar.markdown("---")
@@ -331,13 +322,10 @@ def load_rules(text: str) -> Dict:
     text = text.strip()
     if not text:
         return {}
-    # JSON first
     if text.startswith("{") or text.startswith("["):
         return json.loads(text)
-    # YAML second (if available)
     if HAVE_YAML:
         return yaml.safe_load(text)
-    # Fallback
     raise RuntimeError("Rules not JSON and PyYAML not installed.")
 
 try:
@@ -377,33 +365,29 @@ with st.expander("Show edges"):
 
 st.subheader("3) Deterministic FMEDA (baseline from rules)")
 
-# Build baseline using matchers' failure_modes
 
-def match_type_by_rules(label: str, initial_type: str) -> str:
-    """Decide node type based on label using RULES.matchers.
-    Robust against empty/partial rules and returns initial_type if no match."""
+def match_type_by_rules(rules: Dict, label: str, initial_type: str) -> str:
+    """Decide node type based on label using rules.matchers. Fallback to initial_type."""
     chosen = initial_type or "functional block"
     try:
         lb = (label or "").lower()
-        matchers = (RULES or {}).get("matchers", [])
+        matchers = (rules or {}).get("matchers", [])
         for m in matchers:
             when = (m or {}).get("when", {}) or {}
             any_contains = [str(s).lower() for s in (when.get("any_label_contains") or [])]
-            any_equals = [str(s).lower() for s in (when.get("any_label_equals") or [])]
+            any_equals   = [str(s).lower() for s in (when.get("any_label_equals")   or [])]
             cond1 = any(s in lb for s in any_contains) if any_contains else False
-            cond2 = any(lb == s for s in any_equals) if any_equals else False
+            cond2 = any(lb == s for s in any_equals)   if any_equals   else False
             if cond1 or cond2:
                 chosen = m.get("set_type", chosen) or chosen
     except Exception:
-        # On any parsing problem, fall back to the initial type
         pass
     return chosen
 
 
-def baseline_fmeda_rows(typed_nodes: List[Dict], rules: Dict, limit_modes: int = 5) -> List[Dict]:
+def baseline_fmeda_rows(nodes_typed: List[Dict], rules: Dict, limit_modes: int = 5) -> List[Dict]:
     rows: List[Dict] = []
     matchers = (rules or {}).get("matchers", [])
-    # Build a quick index of failure modes per assigned type from matchers
     type_to_modes: Dict[str, List[Dict]] = {}
     for m in matchers:
         set_type = m.get("set_type")
@@ -412,13 +396,12 @@ def baseline_fmeda_rows(typed_nodes: List[Dict], rules: Dict, limit_modes: int =
             type_to_modes.setdefault(set_type, []).extend(fms)
 
     rid = 1
-    for n in typed_nodes:
+    for n in nodes_typed:
         label = n.get("label") or "(unnamed)"
         initial_type = n.get("type") or "functional block"
-        use_type = match_type_by_rules(label, initial_type)
+        use_type = match_type_by_rules(rules, label, initial_type)
         modes = type_to_modes.get(use_type, [])[:limit_modes]
         if not modes:
-            # generic fallback
             modes = [
                 {"name":"Open circuit", "local_effect":"Loss of function"},
                 {"name":"Short circuit", "local_effect":"Unintended current path"}
@@ -477,15 +460,14 @@ else:
         compact_nodes = [{
             "id": n["id"],
             "label": n.get("label",""),
-            "type": match_type_by_rules(n.get("label",""), n.get("type","functional block"))
+            "type": match_type_by_rules(RULES, n.get("label",""), n.get("type","functional block"))
         } for n in typed_nodes]
         compact_edges = [{"s": e.get("source"), "t": e.get("target"), "label": e.get("label","")} for e in edges]
 
-        # Prompt construction
         system_prompt = (
             "You are a functional safety engineer expert in IC PMIC/charger FMEDA. "
-            "You must reason over a given block diagram graph (nodes+edges), apply user rules, "
-            "follow failure propagation, identify potential violations of provided safety goals, "
+            "Reason over the provided block diagram (nodes+edges), apply user rules, "
+            "follow failure propagation, identify potential violations of the given safety goals, "
             "explain the propagation, and output an FMEDA table in strict JSON."
         )
 
@@ -493,7 +475,7 @@ else:
             "diagram": {"nodes": compact_nodes, "edges": compact_edges},
             "rules": RULES,
             "safety_goals": goals,
-            "limits": {"max_rows": max_rows}
+            "limits": {"max_rows": int(max_rows)}
         }
 
         output_schema = {
@@ -535,63 +517,61 @@ else:
         }
 
         prompt = (
-            "Return ONLY JSON that validates against this JSON Schema. "
-            "Focus FMEDA rows on blocks and failure modes that can plausibly affect the given safety goals. "
-            "Prefer concrete, concise ‘System Effect’, specify which rail/signal is impacted and direction (OV/UV/OC). "
-            "Use Detection/Safety Mechanism fields based on rules or standard PMIC features when obvious; otherwise leave empty. "
-            "Do not exceed max_rows. "
+            "Return ONLY JSON that validates against the provided JSON Schema. "
+            "Focus FMEDA rows on blocks and failure modes that plausibly affect the safety goals. "
+            "Be concrete in 'System Effect' (rail/signal + direction: OV/UV/OC). "
+            "Use Detection/Safety Mechanism when obvious from rules or standard PMIC features; otherwise leave empty. "
+            "Do not exceed max_rows."
         )
 
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": (
-                f"JSON_SCHEMA:\n{json.dumps(output_schema)}\n\nPAYLOAD:\n{json.dumps(user_payload)}\n\nINSTRUCTIONS:\n{prompt}"
+                f"JSON_SCHEMA:\n{json.dumps(output_schema)}\n\n"
+                f"PAYLOAD:\n{json.dumps(user_payload)}\n\n"
+                f"INSTRUCTIONS:\n{prompt}"
             )}
         ]
 
+        # ---- Robust LLM call + JSON extraction ----
         try:
-    with st.spinner("Running LLM analysis..."):
-        # Try to enforce JSON mode; fall back if unsupported
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                response_format={"type": "json_object"}
-            )
-        except Exception:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages
-            )
+            with st.spinner("Running LLM analysis..."):
+                # Try to enforce JSON mode; fall back if unsupported
+                try:
+                    resp = client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        response_format={"type": "json_object"}
+                    )
+                except Exception:
+                    resp = client.chat.completions.create(
+                        model=model,
+                        messages=messages
+                    )
 
-    content = resp.choices[0].message.content or ""
+            content = resp.choices[0].message.content or ""
 
-    # Optional debug: see raw LLM output
-    with st.expander("LLM raw response (debug)"):
-        st.code((content or "")[:4000])
+            with st.expander("LLM raw response (debug)"):
+                st.code((content or "")[:4000])
 
-    # Robust JSON extraction
-    def _extract_json(text: str) -> dict:
-        t = (text or "").strip()
-        if not t:
-            raise ValueError("Empty response from LLM")
-        # Strip fenced code blocks if present
-        if t.startswith("```"):
-            t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
-            t = re.sub(r"```\s*$", "", t)
-            t = t.strip()
-        # Direct parse first
-        try:
-            return json.loads(t)
-        except Exception:
-            # Fallback: take first '{' to last '}'
-            start = t.find("{")
-            end = t.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                return json.loads(t[start:end+1])
-            raise
+            def _extract_json(text: str) -> dict:
+                t = (text or "").strip()
+                if not t:
+                    raise ValueError("Empty response from LLM")
+                if t.startswith("```"):
+                    t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+                    t = re.sub(r"```\s*$", "", t)
+                    t = t.strip()
+                try:
+                    return json.loads(t)
+                except Exception:
+                    start = t.find("{")
+                    end = t.rfind("}")
+                    if start != -1 and end != -1 and end > start:
+                        return json.loads(t[start:end+1])
+                    raise
 
-    data = _extract_json(content)
+            data = _extract_json(content)
         except Exception as e:
             st.error(f"LLM failed: {e}")
             data = None
@@ -601,12 +581,10 @@ else:
             p_df = pd.DataFrame(data.get("propagations", []))
 
             if not f_df.empty:
-                # Add IDs and standard columns if missing
                 f_df.insert(0, "ID", range(1, len(f_df) + 1))
                 for col in ["Severity (S)", "Occurrence (FIT)"]:
                     if col not in f_df.columns:
                         f_df[col] = ""
-                # Reorder
                 preferred = ["ID","Block","Type","Failure Mode","Local Effect","System Effect","Severity (S)","Occurrence (FIT)","Detection","Diagnostic Coverage (%)","Safety Mechanism","Comments"]
                 cols = [c for c in preferred if c in f_df.columns] + [c for c in f_df.columns if c not in preferred]
                 f_df = f_df[cols]
@@ -617,13 +595,13 @@ else:
                 with c1:
                     st.download_button("Download LLM CSV", f_df.to_csv(index=False).encode("utf-8"), file_name="FMEDA_LLM.csv")
                 with c2:
-                    buf = io.BytesIO()
-                    with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
+                    buf2 = io.BytesIO()
+                    with pd.ExcelWriter(buf2, engine="xlsxwriter") as writer:
                         f_df.to_excel(writer, index=False, sheet_name="FMEDA")
                         ws = writer.sheets["FMEDA"]
                         for i, col in enumerate(f_df.columns):
                             ws.set_column(i, i, min(45, max(12, int(f_df[col].astype(str).str.len().quantile(0.9)) + 4)))
-                    st.download_button("Download LLM XLSX", buf.getvalue(), file_name="FMEDA_LLM.xlsx")
+                    st.download_button("Download LLM XLSX", buf2.getvalue(), file_name="FMEDA_LLM.xlsx")
                 with c3:
                     st.download_button("Download LLM JSON", f_df.to_json(orient="records", force_ascii=False, indent=2), file_name="FMEDA_LLM.json")
             else:
@@ -640,4 +618,4 @@ else:
 # ----------------------------- Footer -----------------------------
 
 st.markdown("---")
-st.caption("This tool parses a draw.io IC block diagram, applies user-defined rules, optionally uses an LLM to follow failure propagation against safety goals, and outputs an FMEDA table.")
+st.caption("Parses a draw.io IC block diagram, applies user-defined rules, optionally uses an LLM to follow failure propagation against safety goals, and outputs an FMEDA table.")
