@@ -380,19 +380,23 @@ st.subheader("3) Deterministic FMEDA (baseline from rules)")
 # Build baseline using matchers' failure_modes
 
 def match_type_by_rules(label: str, initial_type: str) -> str:
-    if not RULES:
-        return initial_type
-    matchers = (RULES or {}).get("matchers", [])
-    lb = (label or "").lower()
-    chosen = initial_type
-    for m in matchers:
-        when = (m or {}).get("when", {})
-        any_contains = [s.lower() for s in (when.get("any_label_contains") or [])]
-        any_equals = [s.lower() for s in (when.get("any_label_equals") or [])]
-        cond1 = any(any(s in lb for s in any_contains)) if any_contains else False
-        cond2 = (lb in any_equals) if any_equals else False
-        if cond1 or cond2:
-            chosen = m.get("set_type", chosen)
+    """Decide node type based on label using RULES.matchers.
+    Robust against empty/partial rules and returns initial_type if no match."""
+    chosen = initial_type or "functional block"
+    try:
+        lb = (label or "").lower()
+        matchers = (RULES or {}).get("matchers", [])
+        for m in matchers:
+            when = (m or {}).get("when", {}) or {}
+            any_contains = [str(s).lower() for s in (when.get("any_label_contains") or [])]
+            any_equals = [str(s).lower() for s in (when.get("any_label_equals") or [])]
+            cond1 = any(s in lb for s in any_contains) if any_contains else False
+            cond2 = any(lb == s for s in any_equals) if any_equals else False
+            if cond1 or cond2:
+                chosen = m.get("set_type", chosen) or chosen
+    except Exception:
+        # On any parsing problem, fall back to the initial type
+        pass
     return chosen
 
 
