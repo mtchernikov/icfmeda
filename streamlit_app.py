@@ -550,13 +550,48 @@ else:
         ]
 
         try:
-            with st.spinner("Running LLM analysis..."):
-                resp = client.chat.completions.create(model=model, messages=messages)
-            content = resp.choices[0].message.content or ""
-            # try to extract JSON
-            m = re.search(r"\{[\s\S]*\}\s*$", content)
-            json_text = m.group(0) if m else content
-            data = json.loads(json_text)
+    with st.spinner("Running LLM analysis..."):
+        # Try to enforce JSON mode; fall back if unsupported
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                response_format={"type": "json_object"}
+            )
+        except Exception:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=messages
+            )
+
+    content = resp.choices[0].message.content or ""
+
+    # Optional debug: see raw LLM output
+    with st.expander("LLM raw response (debug)"):
+        st.code((content or "")[:4000])
+
+    # Robust JSON extraction
+    def _extract_json(text: str) -> dict:
+        t = (text or "").strip()
+        if not t:
+            raise ValueError("Empty response from LLM")
+        # Strip fenced code blocks if present
+        if t.startswith("```"):
+            t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+            t = re.sub(r"```\s*$", "", t)
+            t = t.strip()
+        # Direct parse first
+        try:
+            return json.loads(t)
+        except Exception:
+            # Fallback: take first '{' to last '}'
+            start = t.find("{")
+            end = t.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return json.loads(t[start:end+1])
+            raise
+
+    data = _extract_json(content)
         except Exception as e:
             st.error(f"LLM failed: {e}")
             data = None
