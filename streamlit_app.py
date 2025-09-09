@@ -475,7 +475,7 @@ else:
             "label": n.get("label",""),
             "type": match_type_by_rules(n.get("label",""), n.get("type","functional block"))
         } for n in typed_nodes]
-        compact_edges = [{"s": e.get("source"), "t": e.get("target"), "label": e.get("label","")) for e in edges]
+        compact_edges = [{"s": e.get("source"), "t": e.get("target"), "label": e.get("label","")} for e in edges]
 
         # Prompt construction
         system_prompt = (
